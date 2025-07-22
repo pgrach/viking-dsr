@@ -1,0 +1,30 @@
+# Hydro Bitcoin Mining Optimizer Configuration
+
+# ASIC Specifications
+asic:
+  model: "Whatsminer M63s++ Hydro"
+  hash_rate_th: 460
+  watts_per_th: 15.5
+  price_usd_per_th: 14.9
+
+# Operating Costs
+operating_costs:
+  annual_usd: 50000  # Annual operating expenses
+  
+# Simulation Parameters
+simulation:
+  n_simulations: 200   # Number of Monte Carlo simulations (reduced for speed)
+  fleet_step: 15       # Step size for fleet optimization (increased for fewer tests)
+  projection_years: 2  # Years to project forward (reduced for speed)
+
+# Economic Scenarios
+scenarios:
+  custom:
+    name: "Custom Parameters"
+    difficulty_growth_annual: 0.00  # Will use historical 365-day values as default
+    price_change_annual: 0.00       # Will use historical 365-day values as default
+    description: "Adjustable parameters based on historical data"
+
+# Financial Parameters
+financial:
+  pool_fee_percent: 0.02             # 2% mining pool fee
