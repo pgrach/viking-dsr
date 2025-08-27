@@ -5,6 +5,8 @@ import plotly.graph_objects as go
 import plotly.express as px
 import yaml
 from datetime import datetime, timedelta
+import os, re, glob
+from pathlib import Path
 from hydro_miner_model import (
     load_hydro_data, load_btc_data, analyze_power_profile,
     run_monte_carlo_simulation, calculate_optimal_fleet,
@@ -13,7 +15,7 @@ from hydro_miner_model import (
 
 # Page configuration
 st.set_page_config(
-    page_title="Hydro Bitcoin Mining Optimizer",
+    page_title="Power-Constrained Bitcoin Mining Optimizer",
     page_icon="⚡",
     layout="wide"
 )
@@ -24,11 +26,43 @@ def load_config():
     with open('config.yaml', 'r') as file:
         return yaml.safe_load(file)
 
+# Helper: find latest Viking CSV by end date in filename, fallback to modified time
+def find_latest_viking_csv(search_dir: str = "."):
+    pattern = os.path.join(search_dir, "viking_halfhourly_curtailment_*.csv")
+    files = glob.glob(pattern)
+    if not files:
+        return None
+    rx = re.compile(r"viking_halfhourly_curtailment_(\d{4}-\d{2}-\d{2})_to_(\d{4}-\d{2}-\d{2})\.csv$", re.IGNORECASE)
+    best = None
+    for f in files:
+        m = rx.search(os.path.basename(f))
+        if m:
+            try:
+                end_date = datetime.strptime(m.group(2), "%Y-%m-%d").date()
+            except ValueError:
+                end_date = None
+            if end_date is not None and (best is None or end_date > best[0]):
+                best = (end_date, f)
+    if best:
+        return best[1]
+    # Fallback to newest by modified time
+    return max(files, key=os.path.getmtime)
+
 # Load data functions
 @st.cache_data
-def get_hydro_analysis():
-    hydro_data = load_hydro_data('hydro_flow.csv')
-    return analyze_power_profile(hydro_data)
+def get_hydro_analysis(hydro_csv_path: str, file_mtime: float):
+    # file_mtime included to invalidate cache when source file updates
+    hydro_data = load_hydro_data(hydro_csv_path)
+    stats = analyze_power_profile(hydro_data)
+    # Attach metadata for transparency
+    stats['source_file'] = os.path.basename(hydro_csv_path)
+    try:
+        stats['n_rows'] = len(hydro_data)
+        stats['start_ts'] = pd.to_datetime(hydro_data['timestamp']).min()
+        stats['end_ts'] = pd.to_datetime(hydro_data['timestamp']).max()
+    except Exception:
+        stats['n_rows'] = None
+    return stats
 
 @st.cache_data
 def get_btc_data():
@@ -42,8 +76,8 @@ if 'simulation_results' not in st.session_state:
     st.session_state.simulation_results = None
 
 # Header
-st.title("⚡ Hydro Bitcoin Mining Optimizer")
-st.markdown("*Optimize ASIC fleet size for run-of-river hydroelectric power*")
+st.title("⚡ Power-Constrained Bitcoin Mining Optimizer")
+st.markdown("*Optimize ASIC fleet size for variable, intermittent power (hydro, wind, solar, grid-flex, etc.)*")
 
 # Sidebar configuration
 with st.sidebar:
@@ -52,6 +86,20 @@ with st.sidebar:
     # Load default config and data
     config = load_config()
     btc_data = get_btc_data()
+    
+    # Hydro data source detection
+    latest_hydro_csv = find_latest_viking_csv(".")
+    if latest_hydro_csv is None:
+        st.error("No viking_halfhourly_curtailment_*.csv found in the project directory.")
+        st.stop()
+    hydro_file_mtime = os.path.getmtime(latest_hydro_csv)
+    st.session_state['hydro_csv_path'] = latest_hydro_csv
+    st.session_state['hydro_csv_mtime'] = hydro_file_mtime
+
+    st.caption(f"📄 Using power CSV: {Path(latest_hydro_csv).name}")
+    if st.button("Refresh hydro data cache"):
+        get_hydro_analysis.clear()
+        st.rerun()
     
     # Clear cache if old format is detected (missing data_date)
     if 'data_date' not in btc_data:
@@ -81,7 +129,7 @@ with st.sidebar:
     # Overclocking capability toggle
     enable_overclocking = st.checkbox(
         "🚀 Enable Overclocking Mode",
-        value=False,
+        value=config.get('asic', {}).get('overclocking_enabled', True),
         help="Allow ASICs to run in overclocked mode when excess power is available"
     )
     
@@ -183,7 +231,7 @@ with st.sidebar:
     with col_discount:
         discount_rate = st.number_input(
             "Discount Rate (%)",
-            value=15.0,
+            value=float(config.get('financial', {}).get('discount_rate_percent', 0.10) * 100),
             min_value=0.0,
             max_value=50.0,
             step=0.5,
@@ -200,7 +248,7 @@ with st.sidebar:
     )
     additional_upfront_costs = st.number_input(
         "Additional Upfront Costs ($)", 
-        value=0, 
+        value=int(config.get('financial', {}).get('additional_upfront_costs', 0)), 
         min_value=0,
         help="Setup costs: installation, infrastructure, permits, etc."
     )
@@ -211,19 +259,20 @@ with st.sidebar:
     with col_sim:
         n_simulations = st.number_input(
             "Monte Carlo Runs", 
-            value=min(config['simulation']['n_simulations'], 1000), 
+            value=int(config['simulation']['n_simulations']), 
             min_value=100, 
-            max_value=2000,
+            max_value=1000,
             step=100,
-            help="Number of simulation runs (more = accurate but slower)"
+            help="Number of simulation runs (fewer = faster, recommended 500)"
         )
     with col_step:
         fleet_step = st.number_input(
             "Fleet Size Step", 
-            value=config['simulation']['fleet_step'], 
-            min_value=1, 
-            max_value=50,
-            help="ASIC increment for testing different fleet sizes"
+            value=20, 
+            min_value=5, 
+            max_value=100,
+            step=5,
+            help="ASIC increment for testing different fleet sizes (larger = faster, recommended 20+)"
         )
     
     projection_years = st.number_input(
@@ -236,44 +285,49 @@ with st.sidebar:
     
     st.subheader("📈 Economic Parameters")
     
-    # Use only the custom scenario with historical defaults
+    # Use only the custom scenario; defaults loaded from config
     selected_scenario = config['scenarios']['custom'].copy()
+    selected_scenario['difficulty_growth_annual'] = float(selected_scenario.get('difficulty_growth_annual', 0.10))
+    selected_scenario['price_change_annual'] = float(selected_scenario.get('price_change_annual', 0.10))
+    selected_scenario['price_volatility_annual'] = float(selected_scenario.get('price_volatility_annual', 0.10))
     
-    # Set defaults to historical values
-    selected_scenario['difficulty_growth_annual'] = btc_data['difficulty_growth_annual']
-    selected_scenario['price_change_annual'] = btc_data['price_growth_annual']
-    selected_scenario['price_volatility_annual'] = btc_data['price_volatility_annual']
-    
-    st.markdown("**🎛️ Adjust Parameters (defaults based on historical 365-day data)**")
+    st.markdown("**🎛️ Adjust Parameters (defaults loaded from configuration)**")
+
+    # Helper function to round to the nearest step for sliders
+    def round_to_step(value, step):
+        return step * round(value / step)
     
     col_diff, col_price = st.columns(2)
     with col_diff:
+        difficulty_default = np.clip(np.nan_to_num(selected_scenario['difficulty_growth_annual'] * 100), -50.0, 150.0)
         custom_difficulty_growth = st.slider(
             "Difficulty Growth (%/year)",
             min_value=-50.0,
             max_value=150.0,
-            value=selected_scenario['difficulty_growth_annual'] * 100,
+            value=round_to_step(difficulty_default, 1.0),
             step=1.0,
             format="%.1f%%",
             help="Expected annual change in mining difficulty"
         ) / 100.0
     
     with col_price:
+        price_default = np.clip(np.nan_to_num(selected_scenario['price_change_annual'] * 100), -50.0, 150.0)
         custom_price_change = st.slider(
             "Price Change (%/year)",
             min_value=-50.0,
             max_value=150.0,
-            value=selected_scenario['price_change_annual'] * 100,
+            value=round_to_step(price_default, 1.0),
             step=1.0,
             format="%.1f%%",
             help="Expected annual Bitcoin price growth"
         ) / 100.0
     
+    volatility_default = np.clip(np.nan_to_num(selected_scenario['price_volatility_annual'] * 100), 0.0, 200.0)
     custom_price_volatility = st.slider(
         "Price Volatility (%/year)",
         min_value=0.0,
         max_value=200.0,
-        value=selected_scenario['price_volatility_annual'] * 100,
+        value=round_to_step(volatility_default, 5.0),
         step=5.0,
         format="%.1f%%",
         help="Expected annual price volatility (uncertainty)"
@@ -282,6 +336,8 @@ with st.sidebar:
     selected_scenario['difficulty_growth_annual'] = custom_difficulty_growth
     selected_scenario['price_change_annual'] = custom_price_change
     selected_scenario['price_volatility_annual'] = custom_price_volatility
+
+    # (Reverted) Projections will use median of annual average price as before
 
     with st.expander("📋 Current Parameters", expanded=True):
         st.markdown(f"**{selected_scenario['name']}**")
@@ -322,11 +378,15 @@ col1, col2 = st.columns([3, 2])
 
 with col1:
     st.header("📊 Power Analysis")
-    hydro_stats = get_hydro_analysis()
+    hydro_stats = get_hydro_analysis(
+        st.session_state['hydro_csv_path'],
+        st.session_state['hydro_csv_mtime']
+    )
+    st.caption(f"📂 Power data source: {hydro_stats.get('source_file','unknown')} • Intervals: {hydro_stats.get('n_rows','?')}")
     
     # Add validation warning if power is very low
     if hydro_stats['max_power_kw'] < 50:
-        st.warning("⚠️ **Low Power Alert**: Your hydro facility has very low power output. Consider reviewing the data or consulting with a power systems engineer.")
+        st.warning("⚠️ **Low Power Alert**: Your site has very low available power. Consider reviewing the data or consulting with a power systems engineer.")
     
     # Display power statistics
     metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
@@ -340,7 +400,7 @@ with col1:
         st.metric(
             "⏰ Uptime", 
             f"{hydro_stats['uptime_percent']:.1f}%", 
-            help="Percentage of time the hydro plant generates any power"
+            help="Percentage of time the site generates any power"
         )
     with metrics_col3:
         st.metric(
@@ -355,16 +415,16 @@ with col1:
             help="Maximum recorded power output"
         )
     
+
     # Power capacity insights
     asic_power_kw = asic_hashrate * asic_power / 1000
     max_asics = int(hydro_stats['max_power_kw'] / asic_power_kw)
     baseload_asics = int(hydro_stats['op_p10_power_kw'] / asic_power_kw)
-    
+
     if enable_overclocking:
         asic_power_kw_oc = asic_hashrate_oc * asic_power_oc / 1000
         max_asics_oc = int(hydro_stats['max_power_kw'] / asic_power_kw_oc)
         baseload_asics_oc = int(hydro_stats['op_p10_power_kw'] / asic_power_kw_oc)
-        
         st.info(f"""
         💡 **Power Insights for {asic_model} with Overclocking**:
         - **Standard mode capacity**: {max_asics} ASICs ({max_asics * asic_power_kw:.0f} kW)
@@ -372,7 +432,7 @@ with col1:
         - **Reliable baseload (standard)**: {baseload_asics} ASICs can run 90% of the time when plant is ON (effective {baseload_asics * asic_power_kw / hydro_stats['max_power_kw'] * 100:.0f}% of max capacity)
         - **Reliable baseload (overclocked)**: {baseload_asics_oc} ASICs can run 90% of the time when plant is ON (effective {baseload_asics_oc * asic_power_kw_oc / hydro_stats['max_power_kw'] * 100:.0f}% of max capacity)
         - **Smart scaling**: Fleet automatically adjusts between modes based on available power
-        - **Note**: Plant uptime is {hydro_stats['uptime_percent']:.1f}%, so actual availability varies
+    - **Note**: Site uptime is {hydro_stats['uptime_percent']:.1f}%, so actual availability varies
         """)
     else:
         st.info(f"""
@@ -380,16 +440,25 @@ with col1:
         - **Maximum capacity**: {max_asics} ASICs ({max_asics * asic_power_kw:.0f} kW)
         - **Reliable baseload**: {baseload_asics} ASICs can run 90% of the time when plant is ON (effective {baseload_asics * asic_power_kw / hydro_stats['max_power_kw'] * 100:.0f}% of max capacity)
         - **Power per ASIC**: {asic_power_kw:.1f} kW
-        - **Note**: Plant uptime is {hydro_stats['uptime_percent']:.1f}%, so actual availability varies
+    - **Note**: Site uptime is {hydro_stats['uptime_percent']:.1f}%, so actual availability varies
         """)
+
+    # --- Fleet sizes to test: always define for plotting and simulation ---
+    max_possible_asics = max_asics
+    num_fleet_sizes = min(20, max_possible_asics)
+    if num_fleet_sizes > 1:
+        fleet_sizes_to_test = np.linspace(1, max_possible_asics, num=num_fleet_sizes, dtype=int)
+        fleet_sizes_to_test = np.unique(fleet_sizes_to_test).tolist()
+    elif max_possible_asics >= 1:
+        fleet_sizes_to_test = [1]
+    else:
+        fleet_sizes_to_test = []
 
     # Power duration curve with enhanced visualization
     st.subheader("Power Duration Curve")
-    
     fig_duration = go.Figure()
     percentiles = list(hydro_stats['power_percentiles'].keys())
     power_values = list(hydro_stats['power_percentiles'].values())
-    
     # Main power curve
     fig_duration.add_trace(go.Scatter(
         x=percentiles,
@@ -400,19 +469,9 @@ with col1:
         line=dict(color='#1f77b4', width=3),
         hovertemplate='<b>Power Duration</b><br>Exceedance: %{x}%<br>Power: %{y:.0f} kW<extra></extra>'
     ))
-    
-    # Add ASIC power requirements with better styling
+    # Show horizontal lines for only the tested fleet sizes
     colors = ['#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
-    asic_power_kw = asic_hashrate * asic_power / 1000
-    max_possible_asics = int(hydro_stats['max_power_kw'] / asic_power_kw)
-    
-    # Show fleet lines up to max power capacity
-    fleet_lines_to_show = list(range(fleet_step, max_possible_asics + 1, fleet_step))
-    # Add the exact max if it's not already included
-    if max_possible_asics not in fleet_lines_to_show and max_possible_asics > 0:
-        fleet_lines_to_show.append(max_possible_asics)
-    
-    for i, n_asics in enumerate(fleet_lines_to_show):  # Show all fleet lines
+    for i, n_asics in enumerate(fleet_sizes_to_test):
         fig_duration.add_hline(
             y=n_asics * asic_power_kw,
             line_dash="dash",
@@ -617,43 +676,31 @@ with col2:
     st.info("💡 **Chart Tip**: This shows how Bitcoin price and mining difficulty have evolved over time. Both metrics directly impact mining profitability.")
 
 # Simulation results section
+
 if run_simulation:
     st.header("🎯 Optimization Results")
-    
-    # Pre-simulation validation
-    if enable_overclocking:
-        # With overclocking, we test up to standard mode capacity but can run fewer in overclock mode
-        max_possible_asics = int(hydro_stats['max_power_kw'] / (asic_hashrate * asic_power / 1000)) if asic_hashrate * asic_power > 0 else 0
-        max_possible_asics_oc = int(hydro_stats['max_power_kw'] / (asic_hashrate_oc * asic_power_oc / 1000)) if asic_hashrate_oc * asic_power_oc > 0 else 0
-        st.info(f"🔧 **Fleet Size Testing Range**: Will test 1 to {max_possible_asics} ASICs (max {max_possible_asics_oc} in pure overclock mode)")
-    else:
-        max_possible_asics = int(hydro_stats['max_power_kw'] / (asic_hashrate * asic_power / 1000)) if asic_hashrate * asic_power > 0 else 0
-    
-    # Show estimated runtime now that we have max_possible_asics
-    estimated_time = (n_simulations * len(range(fleet_step, max_possible_asics + 1, fleet_step))) / 50000
+
+    # Show estimated runtime
+    estimated_time = (n_simulations * len(fleet_sizes_to_test)) / 50000
     if estimated_time < 1:
         time_text = f"~{estimated_time*60:.0f} seconds"
     else:
         time_text = f"~{estimated_time:.1f} minutes"
     st.caption(f"⏱️ Estimated runtime: {time_text}")
-    
-    if max_possible_asics < fleet_step:
-        st.error(f"❌ **Configuration Error**: Your fleet step ({fleet_step}) is larger than the maximum possible ASICs ({max_possible_asics}). Please reduce the fleet step in the sidebar.")
+
+    if len(fleet_sizes_to_test) < 1:
+        st.error("❌ **Power Insufficient**: Your site cannot power even a single ASIC. Consider using more efficient miners or verify your power data.")
         st.stop()
-    
-    if max_possible_asics < 1:
-        st.error("❌ **Power Insufficient**: Your hydro facility cannot power even a single ASIC. Consider using more efficient miners or verify your power data.")
-        st.stop()
-    
+
     # Enhanced progress display
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
+
     try:
         with st.spinner("🔄 Initializing Monte Carlo simulation..."):
-            status_text.text(f"🚀 Starting {n_simulations:,} simulations across {len(range(fleet_step, max_possible_asics + 1, fleet_step))} fleet sizes...")
+            status_text.text(f"🚀 Starting {n_simulations:,} simulations across {len(fleet_sizes_to_test)} fleet sizes...")
             progress_bar.progress(0.1)
-            
+
             # Prepare ASIC specs
             asic_specs = {
                 'model': asic_model,
@@ -667,30 +714,30 @@ if run_simulation:
                 'watts_per_th_oc': asic_power_oc,
                 'power_consumption_kw_oc': asic_hashrate_oc * asic_power_oc / 1000
             }
-            
+
             progress_bar.progress(0.2)
             status_text.text("⚙️ Running simulations... This may take a few minutes.")
-            
-            # Run simulation
+
+            # Run simulation using only the selected fleet sizes
             simulation_results = run_monte_carlo_simulation(
                 hydro_stats=hydro_stats,
                 btc_data=btc_data,
                 asic_specs=asic_specs,
                 annual_opex=annual_opex,
                 n_simulations=n_simulations,
-                fleet_step=fleet_step,
+                fleet_sizes=fleet_sizes_to_test,
                 scenario_params=selected_scenario,
                 projection_years=projection_years,
                 pool_fee=pool_fee,
                 discount_rate=discount_rate,
                 additional_upfront_costs=additional_upfront_costs
             )
-            
+
             progress_bar.progress(0.9)
             status_text.text("📊 Processing results...")
-            
+
             st.session_state.simulation_results = simulation_results
-            
+
             progress_bar.progress(1.0)
             status_text.text("✅ Simulation complete!")
             
@@ -703,235 +750,284 @@ if run_simulation:
         # Clean up progress indicators
         progress_bar.empty()
         status_text.empty()
-    
+
     # Display results
     results = st.session_state.simulation_results
-    
+
     if not results or not results.get('fleet_sizes'):
         st.error("❌ No simulation results generated. Please check your configuration and try again.")
         st.stop()
-    
+
     # Success message
     st.success(f"🎉 **Optimization Complete!** Analyzed {len(results['fleet_sizes'])} fleet configurations using {n_simulations:,} Monte Carlo simulations.")
-    
+
     # Optimal fleet recommendation with enhanced display
     st.subheader("🏆 Optimal Fleet Recommendation")
-    
+
     optimal = calculate_optimal_fleet(results, hydro_stats, asic_specs)
-    
-    # Create attractive metrics display
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric(
-            "🎯 Recommended ASICs", 
-            f"{optimal['n_asics']:,}",
-            help="Optimal number of ASIC miners for maximum risk-adjusted returns"
-        )
-    with col2:
-        npv_color = "normal" if optimal['expected_npv'] > 0 else "inverse"
-        st.metric(
-            "💰 Expected NPV", 
-            f"${optimal['expected_npv']:,.0f}",
-            delta=f"${optimal['expected_npv']:,.0f}" if optimal['expected_npv'] > 0 else None,
-            delta_color=npv_color,
-            help="Net Present Value - total profit in today's dollars"
-        )
-    with col3:
-        irr_color = "normal" if optimal['irr_median'] > discount_rate * 100 else "inverse"
-        st.metric(
-            "📈 Median IRR", 
-            f"{optimal['irr_median']:.1f}%",
-            delta=f"vs {discount_rate*100:.1f}% target",
-            delta_color=irr_color,
-            help="Internal Rate of Return - annualized profit rate"
-        )
-    with col4:
-        payback_color = "normal" if optimal['payback_months'] < 24 else "inverse"
-        st.metric(
-            "⏰ Payback Period", 
-            f"{optimal['payback_months']:.1f} months",
-            delta="Quick" if optimal['payback_months'] < 18 else "Slow" if optimal['payback_months'] > 36 else None,
-            delta_color=payback_color,
-            help="Time to recover initial investment"
-        )
-    
-    # Add investment summary
-    total_investment = optimal['n_asics'] * asic_specs['unit_price'] + additional_upfront_costs
-    st.info(f"""
-    💼 **Investment Summary**: 
-    - **Total Investment**: ${total_investment:,.0f} ({optimal['n_asics']} × ${asic_specs['unit_price']:,.0f} + ${additional_upfront_costs:,.0f} setup)
-    - **Risk Assessment**: {optimal['risk_assessment']}
-    - **Power Usage**: {optimal['n_asics'] * asic_specs['power_consumption_kw']:.0f} kW ({optimal['n_asics'] * asic_specs['power_consumption_kw'] / hydro_stats['max_power_kw'] * 100:.1f}% of max capacity)
-    """)
-    
-    # NPV by fleet size
-    st.subheader("NPV Analysis by Fleet Size")
-    
-    fig_npv = go.Figure()
-    
-    # Add percentile bands
-    fig_npv.add_trace(go.Scatter(
-        x=results['fleet_sizes'],
-        y=results['npv_p10'],
-        fill=None,
-        mode='lines',
-        line_color='rgba(0,100,80,0)',
-        showlegend=False
-    ))
-    
-    fig_npv.add_trace(go.Scatter(
-        x=results['fleet_sizes'],
-        y=results['npv_p90'],
-        fill='tonexty',
-        mode='lines',
-        line_color='rgba(0,100,80,0)',
-        name='P10-P90 Range'
-    ))
-    
-    fig_npv.add_trace(go.Scatter(
-        x=results['fleet_sizes'],
-        y=results['npv_expected'],
-        mode='lines+markers',
-        name='Expected NPV',
-        line=dict(color='blue', width=3)
-    ))
-    
-    # Mark optimal point
-    fig_npv.add_trace(go.Scatter(
-        x=[optimal['n_asics']],
-        y=[optimal['expected_npv']],
-        mode='markers',
-        marker=dict(size=15, color='red', symbol='star'),
-        name='Optimal'
-    ))
-    
-    fig_npv.update_layout(
-        xaxis_title="Number of ASICs",
-        yaxis_title="Net Present Value ($)",
-        height=400
-    )
-    st.plotly_chart(fig_npv, use_container_width=True)
-    
-    # Risk metrics
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Risk Metrics")
 
-        risk_df = pd.DataFrame({
-            'Fleet Size': results['fleet_sizes'],
-            'Probability of Loss (%)': results['prob_loss'] * 100,
-            'Value at Risk (95%)': results['var_95'],
-            'Sharpe Ratio': results['sharpe_ratio']
-        })
+    if optimal and optimal.get('n_asics', 0) > 0:
+        st.info(optimal['recommendation'])
 
-        # Format for display
-        display_df = risk_df.copy()
-        display_df['Probability of Loss (%)'] = display_df['Probability of Loss (%)'].map('{:.1f}%'.format)
-        display_df['Value at Risk (95%)'] = display_df['Value at Risk (95%)'].map('${:,.0f}'.format)
-        display_df['Sharpe Ratio'] = display_df['Sharpe Ratio'].map('{:.2f}'.format)
+        # Display key metrics for the optimal fleet
+        opt_col1, opt_col2, opt_col3, opt_col4 = st.columns(4)
+        with opt_col1:
+            st.metric("Recommended ASICs", f"{optimal['n_asics']}", help="Optimal number of ASICs based on maximizing risk-adjusted returns.")
+        with opt_col2:
+            st.metric("Expected NPV", f"${optimal['expected_npv']:,.0f}", help="Average Net Present Value over all simulations.")
+        with opt_col3:
+            st.metric("Payback Period", f"{optimal['payback_months']:.1f} months", help="Median time to recover initial investment.")
+        with opt_col4:
+            st.metric("IRR (Median)", f"{optimal['irr_median']:.1f}%", help="Median Internal Rate of Return from simulations.")
 
-        st.dataframe(display_df.set_index('Fleet Size'))
+        # Installed power metrics for the recommended fleet
+        installed_power_standard_kw = optimal['n_asics'] * asic_specs['power_consumption_kw']
+        if enable_overclocking:
+            installed_power_oc_kw = optimal['n_asics'] * asic_specs['power_consumption_kw_oc']
+            ip_col1, ip_col2 = st.columns(2)
+            with ip_col1:
+                st.metric("Installed Power (Standard)", f"{installed_power_standard_kw:,.0f} kW")
+            with ip_col2:
+                st.metric("Installed Power (OC)", f"{installed_power_oc_kw:,.0f} kW")
+        else:
+            st.metric("Installed Power", f"{installed_power_standard_kw:,.0f} kW")
 
-        # Add VaR chart
-        fig_var = px.line(risk_df, x='Fleet Size', y='Value at Risk (95%)',
-                          title='Value at Risk (95%) by Fleet Size')
-        fig_var.update_layout(height=250, yaxis_title="VaR ($)")
-        st.plotly_chart(fig_var, use_container_width=True)
+        # Utilization (capacity factor) and power-duration statements
+        # Find index for the recommended fleet size to pull capacity factor
+        try:
+            rec_idx = results['fleet_sizes'].index(optimal['n_asics'])
+        except ValueError:
+            # Fallback to closest size
+            fleets = results.get('fleet_sizes', []) or []
+            if fleets:
+                rec_idx = int(np.argmin([abs(s - optimal['n_asics']) for s in fleets]))
+            else:
+                rec_idx = 0
 
-        # Add Sharpe Ratio chart
-        fig_sharpe = px.line(risk_df, x='Fleet Size', y='Sharpe Ratio',
-                             title='Sharpe Ratio by Fleet Size', color_discrete_sequence=['green'])
-        fig_sharpe.update_layout(height=250, yaxis_title="Ratio")
-        st.plotly_chart(fig_sharpe, use_container_width=True)
-    
-    with col2:
-        st.subheader("Utilization Analysis")
-        
-        util_df = pd.DataFrame({
-            'Fleet Size': results['fleet_sizes'],
-            'Average Utilization (%)': results['avg_utilization'],
-            'Capacity Factor (%)': results['capacity_factor']
-        })
-        
-        fig_util = px.line(util_df, x='Fleet Size', y=['Average Utilization (%)', 'Capacity Factor (%)'],
-                          title='Fleet Utilization Metrics', 
-                          color_discrete_map={
-                              'Average Utilization (%)': 'dodgerblue',
-                              'Capacity Factor (%)': 'mediumorchid'
-                          })
-        fig_util.update_layout(height=300, yaxis_title="Percentage (%)")
-        st.plotly_chart(fig_util, use_container_width=True)
-    
-    # Detailed projections based on the median simulation for the optimal fleet
-    st.subheader(f"📈 Detailed Projections for {optimal['n_asics']} ASICs (Median Scenario)")
+        cap_factor = None
+        if 'capacity_factor' in results and len(results['capacity_factor']) > rec_idx:
+            cap_factor = results['capacity_factor'][rec_idx]
 
-    optimal_n_asics = optimal['n_asics']
-    if optimal_n_asics in results['fleet_sizes']:
-        optimal_idx = results['fleet_sizes'].index(optimal_n_asics)
-        median_details = results['median_simulation_details'][optimal_idx]
-        
-        proj_df, proj_summary = project_mining_economics(
-            median_details_data=median_details,
-            n_asics=optimal_n_asics,
-            asic_price=asic_specs['unit_price'],
-            annual_opex=annual_opex,
-            projection_years=projection_years,
-            discount_rate=discount_rate,
-            additional_upfront_costs=additional_upfront_costs
-        )
+        # Compute H% of hours where available power >= installed power (simulated P50)
+        h_standard = None
+        h_oc = None
+        if 'full_power_percent_std_p50' in results and len(results['full_power_percent_std_p50']) > rec_idx:
+            h_standard = float(results['full_power_percent_std_p50'][rec_idx])
+        if enable_overclocking:
+            oc_key = 'full_power_percent_oc_p50'
+            if oc_key in results and results[oc_key] is not None and len(results[oc_key]) > rec_idx:
+                h_oc = float(results[oc_key][rec_idx])
 
-        # Format columns for display
-        display_df = proj_df.copy()
-        currency_cols = ['Revenue', 'Operating Costs', 'Net Income', 'Cumulative Cash Flow']
-        for col in currency_cols:
-            display_df[col] = display_df[col].map('${:,.0f}'.format)
-        
-        display_df['BTC Mined'] = display_df['BTC Mined'].map('{:.4f}'.format)
-        display_df['Avg BTC Price'] = display_df['Avg BTC Price'].map('${:,.0f}'.format)
-        display_df['Avg Difficulty'] = (display_df['Avg Difficulty'] / 1e12).map('{:.0f}T'.format)
+        util_cols = st.columns(2 if enable_overclocking else 1)
+        with util_cols[0]:
+            if cap_factor is not None and not np.isnan(cap_factor):
+                st.metric("Utilization (Capacity Factor)", f"{cap_factor:.1f}%", help="Hashrate-weighted utilization across periods (P50).")
+            else:
+                st.metric("Utilization (Uptime)", f"{optimal['utilization']:.1f}%", help="Percent of periods with some power available.")
+            if h_standard is not None:
+                st.caption(f"≥ {installed_power_standard_kw/1000:.2f} MW for {h_standard:.1f}% of hours (simulated P50)")
+        if enable_overclocking and len(util_cols) > 1 and h_oc is not None:
+            with util_cols[1]:
+                st.caption(f"≥ {installed_power_oc_kw/1000:.2f} MW for {h_oc:.1f}% of hours (simulated P50)")
 
-        st.dataframe(display_df.set_index('Year'))
+        # Risk and performance metrics
+        risk_col1, risk_col2, risk_col3 = st.columns(3)
+        with risk_col1:
+            st.metric("Risk Assessment", optimal['risk_assessment'], help="Qualitative assessment of investment risk.")
+        with risk_col2:
+            st.metric("Probability of Loss", f"{optimal['prob_loss']:.1%}", help="Chance of NPV being negative after the projection period.")
+        with risk_col3:
+            st.metric("Power Utilization", f"{optimal['utilization']:.1f}%", help="Percentage of time the fleet is actively mining (not idle due to zero power).")
 
-        # Summary report
-        with st.expander("📋 Executive Summary", expanded=True):
-            st.markdown(f"""
-            ### Optimization Results for {selected_scenario['name']} Scenario
+        # --- Detailed Analysis Tabs ---
+        st.subheader("📊 Detailed Analysis")
+        tab1, tab2 = st.tabs(["Financial Projections (Optimal Fleet)", "NPV vs. Fleet Size"])
+
+        with tab1:
+            st.markdown(f"#### Projections for Recommended Fleet of {optimal['n_asics']} ASICs")
             
-            **Recommended Configuration:**
-            - Optimal Fleet Size: **{optimal['n_asics']} ASICs**
-            - Total Investment: **${optimal['n_asics'] * asic_specs['unit_price'] + additional_upfront_costs:,.0f}**
+            # Find the index for the optimal fleet to get its median simulation data (with guard rails)
+            fleet_sizes_res = results.get('fleet_sizes', []) or []
+            details_list = results.get('median_simulation_details', []) or []
 
-            **Financial Metrics (Median Scenario):**
-            - Median NPV (P50): **${results['npv_p50'][optimal_idx]:,.0f}**
-            - Median IRR: **{optimal['irr_median']:.1f}%**
-            - Payback Period: **{optimal['payback_months']:.1f} months**
-            
-            *These metrics are from the same representative simulation, ensuring complete consistency in the analysis.*
+            # Try to find exact index; if missing, pick the closest available fleet size
+            try:
+                optimal_idx = fleet_sizes_res.index(optimal['n_asics'])
+            except ValueError:
+                if not fleet_sizes_res:
+                    st.error("No fleet sizes present in simulation results.")
+                    st.stop()
+                # Fallback: choose the closest fleet size
+                closest_idx = int(np.argmin([abs(s - optimal['n_asics']) for s in fleet_sizes_res]))
+                optimal_idx = closest_idx
 
-            **Key Insights:**
-            - The recommended fleet size is based on maximizing the average NPV across all simulations.
-            - The detailed projection below is from a single, representative simulation whose outcome was closest to the median (P50) NPV.
-            - {optimal['risk_assessment']}
-            
-            **Power Utilization:**
-            - Fleet will operate at 100% capacity {optimal['full_power_percent']:.1f}% of the time
-            - Average throttling level: {optimal['avg_throttle']:.1f}%
-            - Zero production expected {optimal['zero_production_days']:.1f}% of days
-            
-            **Financial Projections ({projection_years} years from Median Simulation):**
-            - Total Revenue: ${proj_summary['total_revenue']:,.0f}
-            - Net Profit: ${proj_summary['total_profit']:,.0f}
-            - Verification NPV: **${proj_summary['npv']:,.0f}** (Matches the P50 NPV, confirming consistency)
-            
-            **Recommendation:** {optimal['recommendation']}
+            # Bound check against details list length
+            if optimal_idx >= len(details_list):
+                st.warning("Result arrays are misaligned; using the closest available projection.")
+                optimal_idx = max(0, len(details_list) - 1)
 
-            ---
-            *Note: This projection represents one specific simulation outcome (the median case). Actual results will vary based on Bitcoin price and mining difficulty changes.*
-            """)
+            median_details = details_list[optimal_idx]
+            
+            # Project economics for the optimal fleet
+            projection_df, summary = project_mining_economics(
+                median_details_data=median_details,
+                n_asics=optimal['n_asics'],
+                asic_price=asic_specs['unit_price'],
+                annual_opex=annual_opex,
+                projection_years=projection_years,
+                discount_rate=discount_rate,
+                additional_upfront_costs=additional_upfront_costs
+            )
+            
+            # Display summary
+            st.metric("Projected Total Profit", f"${summary['total_profit']:,.0f}")
+            
+            # Display formatted table
+            st.dataframe(projection_df.style.format({
+                'BTC Mined': '{:.4f}',
+                'Revenue': '${:,.0f}',
+                'Operating Costs': '${:,.0f}',
+                'Net Income': '${:,.0f}',
+                'Cumulative Cash Flow': '${:,.0f}',
+                'Avg BTC Price': '${:,.0f}',
+                'Avg Difficulty': '{:.2e}',
+                'Energy Used (MWh)': '{:,.0f}',
+                'Available Curtailed Energy (MWh)': '{:,.0f}',
+                'Curtailed Energy Utilization (%)': '{:.1f}%'
+            }))
+            st.caption("Projections are based on the median simulation run for the optimal fleet size.")
+
+            # Optional: Energy comparison chart per year (Used vs Available)
+            if isinstance(median_details, dict) and 'energy_used_mwh' in median_details and 'available_energy_mwh' in median_details:
+                # Summary metrics across the full projection horizon
+                total_used_mwh = float(np.sum(median_details['energy_used_mwh']))
+                total_available_mwh = float(np.sum(median_details['available_energy_mwh']))
+                total_wasted_mwh = max(total_available_mwh - total_used_mwh, 0.0)
+                util_pct_total = (total_used_mwh / total_available_mwh * 100.0) if total_available_mwh > 0 else 0.0
+                # Simple aggregation check (tolerance for FP error)
+                agg_ok = abs((total_used_mwh + total_wasted_mwh) - total_available_mwh) < 1e-6
+
+                st.subheader("Energy Utilization Summary")
+                sum_col1, sum_col2, sum_col3 = st.columns(3)
+                with sum_col1:
+                    st.metric("Total Energy Used (MWh)", f"{total_used_mwh:,.0f}")
+                with sum_col2:
+                    st.metric("Total Curtailed Energy (MWh)", f"{total_available_mwh:,.0f}")
+                with sum_col3:
+                    st.metric("% of Curtailed Energy Utilized", f"{util_pct_total:.1f}%")
+                sum_col4, sum_col5 = st.columns(2)
+                with sum_col4:
+                    st.metric("Total Wasted Energy (MWh)", f"{total_wasted_mwh:,.0f}")
+                with sum_col5:
+                    st.metric("Aggregation Check", "PASS" if agg_ok else "FAIL")
+
+                energy_years = list(range(1, projection_years + 1))
+                energy_df = pd.DataFrame({
+                    'Year': energy_years,
+                    'Energy Used (MWh)': median_details['energy_used_mwh'],
+                    'Available Curtailed Energy (MWh)': median_details['available_energy_mwh']
+                })
+                energy_df['Wasted Energy (MWh)'] = np.maximum(energy_df['Available Curtailed Energy (MWh)'] - energy_df['Energy Used (MWh)'], 0)
+                energy_fig = go.Figure()
+                energy_fig.add_trace(go.Bar(
+                    x=energy_df['Year'], y=energy_df['Available Curtailed Energy (MWh)'],
+                    name='Available Curtailed Energy (MWh)', marker_color='#9ecae1',
+                    hovertemplate='<b>Year %{x}</b><br>Available: %{y:,.0f} MWh<extra></extra>'
+                ))
+                energy_fig.add_trace(go.Bar(
+                    x=energy_df['Year'], y=energy_df['Energy Used (MWh)'],
+                    name='Energy Used (MWh)', marker_color='#3182bd',
+                    hovertemplate='<b>Year %{x}</b><br>Used: %{y:,.0f} MWh<extra></extra>'
+                ))
+                energy_fig.add_trace(go.Bar(
+                    x=energy_df['Year'], y=energy_df['Wasted Energy (MWh)'],
+                    name='Wasted Energy (MWh)', marker_color='#fdd0a2',
+                    hovertemplate='<b>Year %{x}</b><br>Wasted: %{y:,.0f} MWh<extra></extra>'
+                ))
+                energy_fig.update_layout(
+                    barmode='group',
+                    xaxis_title='Year', yaxis_title='MWh', height=350,
+                    yaxis=dict(tickformat=',.0f'),
+                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                )
+                st.plotly_chart(energy_fig, use_container_width=True)
+                st.info("Annual bars show Available, Used, and Wasted (Available−Used). Summary aggregates across years; Utilized % = Used / Available.")
+
+                # Detailed per-year aggregation check
+                with st.expander("Energy aggregation details (per year)", expanded=False):
+                    per_year_df = energy_df.copy()
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        per_year_df['Utilization (%)'] = np.where(
+                            per_year_df['Available Curtailed Energy (MWh)'] > 0,
+                            per_year_df['Energy Used (MWh)'] / per_year_df['Available Curtailed Energy (MWh)'] * 100.0,
+                            0.0
+                        )
+                    per_year_df['Check'] = np.isclose(
+                        per_year_df['Energy Used (MWh)'] + per_year_df['Wasted Energy (MWh)'],
+                        per_year_df['Available Curtailed Energy (MWh)'], atol=1e-6
+                    )
+                    st.dataframe(
+                        per_year_df[['Year','Available Curtailed Energy (MWh)','Energy Used (MWh)','Wasted Energy (MWh)','Utilization (%)','Check']]
+                        .style.format({
+                            'Available Curtailed Energy (MWh)': '{:,.0f}',
+                            'Energy Used (MWh)': '{:,.0f}',
+                            'Wasted Energy (MWh)': '{:,.0f}',
+                            'Utilization (%)': '{:.1f}%'
+                        })
+                    )
+
+        with tab2:
+            st.markdown("#### NPV Distribution Across Fleet Sizes")
+            
+            fig_npv = go.Figure()
+            
+            # P10 to P90 range
+            fig_npv.add_trace(go.Scatter(
+                x=results['fleet_sizes'],
+                y=results['npv_p90'],
+                fill=None,
+                mode='lines',
+                line_color='rgba(0,100,80,0.2)',
+                name='P90 NPV'
+            ))
+            fig_npv.add_trace(go.Scatter(
+                x=results['fleet_sizes'],
+                y=results['npv_p10'],
+                fill='tonexty', # Fill between P10 and P90
+                mode='lines',
+                line_color='rgba(0,100,80,0.2)',
+                name='P10-P90 Range'
+            ))
+            
+            # Expected NPV
+            fig_npv.add_trace(go.Scatter(
+                x=results['fleet_sizes'],
+                y=results['npv_expected'],
+                mode='lines+markers',
+                name='Expected NPV',
+                line=dict(color='rgb(0,100,80)', width=3)
+            ))
+            
+            # Add vertical line for optimal fleet
+            fig_npv.add_vline(
+                x=optimal['n_asics'], 
+                line_dash="dash", 
+                line_color="red",
+                annotation_text=f"Optimal: {optimal['n_asics']} ASICs"
+            )
+            
+            fig_npv.update_layout(
+                xaxis_title="Number of ASICs in Fleet",
+                yaxis_title="Net Present Value ($)",
+                height=450,
+                hovermode='x unified'
+            )
+            st.plotly_chart(fig_npv, use_container_width=True)
+            st.info("💡 This chart shows the range of likely NPV outcomes. The wider the shaded area, the higher the risk (uncertainty).")
+
     else:
-        st.warning("Could not generate detailed projection because the optimal fleet size was not in the simulated set.")
+        st.warning("Could not determine an optimal fleet size. This may be due to insufficient power or unfavorable economic conditions.")
 
 # Footer
 st.markdown("---")
-st.caption("Bitcoin Mining Optimizer | Hydroelectric Power Constraints with Dynamic Throttling")
+st.caption("Bitcoin Mining Optimizer | Power-Constrained Operations with Dynamic Throttling")

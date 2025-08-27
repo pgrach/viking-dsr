@@ -14,17 +14,45 @@ except ImportError:
     ENHANCED_THROTTLING_AVAILABLE = False
 
 def load_hydro_data(filepath):
-    """Load and process hydroelectric power data from CSV file."""
+    """Load and process hydroelectric power data from a half-hourly CSV file."""
     df = pd.read_csv(filepath)
     
-    # Convert date column
-    df['Date'] = pd.to_datetime(df['Date'])
+    # The CSV might have 'Datetime' and 'Available Power (MW)' or the settlement format
+    if 'Datetime' in df.columns:
+        # Handle the format with 'Datetime' and 'Available Power (MW)'
+        df = df.rename(columns={
+            'Datetime': 'timestamp',
+            'Available Power (MW)': 'available_power_mw'
+        })
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['available_power_kw'] = pd.to_numeric(df['available_power_mw'], errors='coerce').fillna(0) * 1000
+
+    elif 'settlement_date' in df.columns:
+        # Handle the format with 'settlement_date' and 'curtailed_mw'
+        df['timestamp'] = pd.to_datetime(df['settlement_date']) + \
+                          pd.to_timedelta((df['settlement_period'] - 1) * 30, unit='m')
+        df['available_power_kw'] = pd.to_numeric(df['curtailed_mw'], errors='coerce').fillna(0) * 1000
+    else:
+        raise ValueError("Hydro data CSV is in an unknown format. Expected columns like 'Datetime' or 'settlement_date'.")
+
+    df = df.dropna(subset=['timestamp'])
+    df = df.set_index('timestamp')
     
-    # Extract key columns
-    df['available_energy_kwh'] = pd.to_numeric(df['Available energy (kWh)'], errors='coerce')
-    df['available_power_kw'] = df['available_energy_kwh'] / 24  # Convert to average power
+    # Ensure a complete time series for the given period at 30-min frequency
+    start_date = df.index.min()
+    end_date = df.index.max()
     
-    return df
+    # Create a complete date range
+    full_range = pd.date_range(start=start_date, end=end_date, freq='30min')
+    
+    # Reindex the dataframe to this full range, filling missing values with 0
+    df = df.reindex(full_range, fill_value=0)
+    
+    # Reset index to have 'timestamp' as a column again
+    df = df.reset_index().rename(columns={'index': 'timestamp'})
+    
+    # Keep only the necessary columns
+    return df[['timestamp', 'available_power_kw']]
 
 def load_btc_data(price_file, difficulty_file):
     """Load and process Bitcoin price and difficulty data."""
@@ -136,7 +164,7 @@ def get_block_reward(dates):
     return np.select(conditions, rewards[:-1], default=rewards[-1])
 
 def analyze_power_profile(hydro_df):
-    """Analyze hydroelectric power availability patterns."""
+    """Analyze hydroelectric power availability patterns from half-hourly data."""
     # Basic statistics
     power_data = hydro_df['available_power_kw'].dropna().values
     
@@ -163,11 +191,16 @@ def analyze_power_profile(hydro_df):
         # For exceedance probability p, we need the (100-p)th percentile
         duration_curve[p] = np.percentile(power_data, 100 - p)
     
-    # Monthly averages
-    hydro_df['month'] = hydro_df['Date'].dt.month
-    monthly_avg = hydro_df.groupby('month')['available_power_kw'].mean().values
+    # Calculate uptime based on periods where power is available
+    uptime_percent = (power_data > 0).sum() / len(power_data) if len(power_data) > 0 else 0
     
-    # Continuous run analysis
+    # Monthly averages
+    hydro_df['month'] = hydro_df['timestamp'].dt.month
+    monthly_avg_series = hydro_df.groupby('month')['available_power_kw'].mean()
+    # Reindex to ensure we have all 12 months, filling missing ones with 0
+    monthly_avg = monthly_avg_series.reindex(range(1, 13), fill_value=0).values.tolist()
+    
+    # Continuous run analysis (now in 30-min periods)
     runs = []
     current_run = 0
     for power in power_data:
@@ -194,24 +227,24 @@ def analyze_power_profile(hydro_df):
         'op_p10_power_kw': operational_percentiles[10],
         'op_p50_power_kw': operational_percentiles[50],
         'power_percentiles': duration_curve,
-        'monthly_avg_power': monthly_avg.tolist(),
-        'uptime_percent': (power_data > 0).sum() / len(power_data) * 100,
-        'zero_power_days': (power_data == 0).sum(),
-        'avg_run_days': np.mean(runs) if runs else 0,
-        'median_run_days': np.median(runs) if runs else 0,
+        'monthly_avg_power': monthly_avg,
+        'uptime_percent': uptime_percent * 100,
+        'zero_power_periods': (power_data == 0).sum(),
+        'avg_run_periods': np.mean(runs) * 0.5 / 24 if runs else 0,  # Convert periods to days
+        'median_run_periods': np.median(runs) * 0.5 / 24 if runs else 0, # Convert periods to days
         'power_distribution': power_data
     }
 
-def simulate_power_availability(hydro_stats, days, seed=None):
-    """Bootstrap simulate future power availability from historical data."""
+def simulate_power_availability(hydro_stats, n_periods, seed=None):
+    """Bootstrap simulate future power availability from historical data for each period."""
     if seed is not None:
         np.random.seed(seed)
     
-    # Use historical distribution with monthly seasonality consideration
+    # Use historical distribution of power available in each 30-min period
     power_dist = hydro_stats['power_distribution']
     
-    # Simple bootstrap - could be enhanced with seasonal patterns
-    simulated_power = np.random.choice(power_dist, size=days, replace=True)
+    # Simple bootstrap from the historical distribution
+    simulated_power = np.random.choice(power_dist, size=n_periods, replace=True)
     
     return simulated_power
 
@@ -240,77 +273,76 @@ def calculate_mining_revenue(hashrate_th, power_available_kw, asic_power_kw, dif
     return revenue, btc_per_day, power_used
 
 def _precompute_simulation_parameters(projection_years, btc_data, scenario_params, sim_seed):
-    """Pre-computes daily price, difficulty, and block rewards for the entire simulation period."""
+    """Pre-computes price, difficulty, and block rewards for each half-hour period of the simulation."""
     np.random.seed(sim_seed)
     
-    n_days = projection_years * 365
+    n_periods = projection_years * 365 * 48
     n_months = projection_years * 12
     
-    # Scenario parameters
+    # Scenario parameters (monthly growth)
     diff_growth_monthly = (1 + scenario_params['difficulty_growth_annual'])**(1/12)
     price_trend_monthly = scenario_params['price_change_annual'] / 12
-    
-    # Use custom volatility if provided, otherwise use historical from btc_data
     price_volatility_annual = scenario_params.get('price_volatility_annual', btc_data['price_volatility_annual'])
     price_vol_monthly = price_volatility_annual / np.sqrt(12)
 
     # --- Generate monthly multipliers ---
     monthly_diff_multipliers = np.cumprod(np.insert(np.full(n_months, diff_growth_monthly), 0, 1))[:-1]
-    
     monthly_shocks = np.random.normal(price_trend_monthly, price_vol_monthly, n_months)
     monthly_price_multipliers = np.cumprod(np.insert(1 + monthly_shocks, 0, 1))[:-1]
 
-    # --- Map days to months for accurate daily values ---
+    # --- Create a timestamp for every half-hour period in the simulation ---
     base_date = pd.to_datetime(datetime.now())
-    dates = base_date + pd.to_timedelta(np.arange(n_days), unit='d')
+    timestamps = base_date + pd.to_timedelta(np.arange(n_periods) * 30, unit='m')
+    dates = pd.to_datetime(timestamps.date) # Get the date part for daily values
+
+    # --- Map periods to months for accurate value projection ---
+    month_indices = (timestamps.year - base_date.year) * 12 + (timestamps.month - base_date.month)
+    month_indices = np.minimum(month_indices, n_months - 1)
+
+    # --- Vectorized Difficulty and Price Calculation ---
+    # These are now period-based, but the underlying growth is still monthly
+    period_diff_multipliers = monthly_diff_multipliers[month_indices]
+    period_difficulty = btc_data['current_difficulty'] * period_diff_multipliers
+
+    period_price_multipliers = monthly_price_multipliers[month_indices]
+    period_price = btc_data['current_price'] * period_price_multipliers
+    np.maximum(period_price, 1000, out=period_price) # Floor price
+
+    # --- Vectorized Block Reward Calculation (based on the date of each period) ---
+    period_block_reward = get_block_reward(dates)
     
-    # Calculate month index for each day (0 for first month, 1 for second, etc.)
-    month_indices = (dates.year - base_date.year) * 12 + (dates.month - base_date.month)
-    month_indices = np.minimum(month_indices, n_months - 1) # Ensure indices are within bounds
-
-    # --- Vectorized Difficulty and Price Calculation using month mapping ---
-    daily_diff_multipliers = monthly_diff_multipliers[month_indices]
-    daily_difficulty = btc_data['current_difficulty'] * daily_diff_multipliers
-
-    daily_price_multipliers = monthly_price_multipliers[month_indices]
-    daily_price = btc_data['current_price'] * daily_price_multipliers
-    np.maximum(daily_price, 1000, out=daily_price) # Floor price
-
-    # --- Vectorized Block Reward Calculation ---
-    daily_block_reward = get_block_reward(dates)
-    
-    return daily_difficulty, daily_price, daily_block_reward
+    return period_difficulty, period_price, period_block_reward
 
 def _run_single_simulation(sim_seed, fleet_sizes_arr, asic_specs, scenario_params, btc_data, hydro_stats, projection_years, annual_opex, discount_rate, pool_fee, additional_upfront_costs):
     """
     Helper function to run a single vectorized simulation for all fleet sizes.
-    This version is optimized to remove daily loops and use matrix operations.
+    This version is optimized for half-hourly periods and uses matrix operations.
     """
     # Extract ASIC parameters
     asic_hashrate = asic_specs['hash_rate_th']
     asic_power_kw = asic_specs['power_consumption_kw']
     asic_price = asic_specs['unit_price']
-    n_days = projection_years * 365
+    n_periods = projection_years * 365 * 48
 
-    # 1. Pre-computation of Time-Dependent Variables
-    daily_difficulty, daily_price, daily_block_reward = _precompute_simulation_parameters(
+    # 1. Pre-computation of Time-Dependent Variables for each 30-min period
+    period_difficulty, period_price, period_block_reward = _precompute_simulation_parameters(
         projection_years, btc_data, scenario_params, sim_seed
     )
-    simulated_power = simulate_power_availability(hydro_stats, n_days, seed=sim_seed)
+    simulated_power = simulate_power_availability(hydro_stats, n_periods, seed=sim_seed)
 
-    # 2. Full Vectorization Across Days AND Fleet Sizes
-    # Reshape daily arrays for broadcasting against fleet arrays
+    # 2. Full Vectorization Across Periods AND Fleet Sizes
+    # Reshape period-based arrays for broadcasting against fleet arrays
     simulated_power_col = simulated_power[:, np.newaxis]
-    daily_difficulty_col = daily_difficulty[:, np.newaxis]
-    daily_price_col = daily_price[:, np.newaxis]
-    daily_block_reward_col = daily_block_reward[:, np.newaxis]
+    period_difficulty_col = period_difficulty[:, np.newaxis]
+    period_price_col = period_price[:, np.newaxis]
+    period_block_reward_col = period_block_reward[:, np.newaxis]
 
     # Calculate fleet requirements (row vector)
     fleet_power_req_row = fleet_sizes_arr * asic_power_kw
     fleet_hashrate_row = fleet_sizes_arr * asic_hashrate
 
     # 3. Enhanced Power Management with Overclocking Support
-    power_mask = simulated_power > 0
+    power_mask = simulated_power_col > 0
     
     if asic_specs.get('enable_overclocking', False) and ENHANCED_THROTTLING_AVAILABLE:
         # Use enhanced throttling that supports overclocking
@@ -319,13 +351,10 @@ def _run_single_simulation(sim_seed, fleet_sizes_arr, asic_specs, scenario_param
         fleet_power_avail = throttling_result['power_used']
     else:
         # Use standard throttling logic
-        fleet_power_req_row = fleet_sizes_arr * asic_power_kw
-        fleet_hashrate_row = fleet_sizes_arr * asic_hashrate
-        
-        # Calculate available power for each fleet size (n_days, n_fleets)
+        # Calculate available power for each fleet size (n_periods, n_fleets)
         fleet_power_avail = np.minimum(simulated_power_col, fleet_power_req_row)
         
-        # Calculate throttle percentage for each fleet on each day
+        # Calculate throttle percentage for each fleet in each period
         throttle = np.divide(fleet_power_avail, fleet_power_req_row, 
                              out=np.zeros_like(fleet_power_avail), 
                              where=fleet_power_req_row > 0)
@@ -333,26 +362,38 @@ def _run_single_simulation(sim_seed, fleet_sizes_arr, asic_specs, scenario_param
         # Calculate effective hashrate based on throttling
         effective_hashrate = fleet_hashrate_row * throttle
     
-    # Calculate daily BTC mined for each fleet
-    btc_mined = (effective_hashrate * 1e12 * 86400 * daily_block_reward_col) / (daily_difficulty_col * 2**32)
+    # Calculate BTC mined in each 30-minute period for each fleet
+    # Note: 86400 seconds/day is replaced with 1800 seconds/period
+    btc_mined = (effective_hashrate * 1e12 * 1800 * period_block_reward_col) / (period_difficulty_col * 2**32)
     
-    # Calculate daily revenue
-    daily_revenue = (btc_mined * daily_price_col) * (1 - pool_fee)
-    daily_revenue[~power_mask, :] = 0
+    # Calculate revenue for each period
+    period_revenue = (btc_mined * period_price_col) * (1 - pool_fee)
+    # Ensure revenue is zero when power is off. Squeeze the mask to 1D for correct broadcasting.
+    period_revenue[~power_mask.squeeze(), :] = 0
+
+    # --- Energy accounting (kW to MWh over 30-min periods) ---
+    # Fleet energy actually used each period for each fleet (periods x fleets)
+    energy_used_mwh_period = (fleet_power_avail * 0.5) / 1000.0
+    # Total curtailed energy available each period (periods x 1)
+    available_energy_mwh_period = (simulated_power_col * 0.5) / 1000.0
     
-    # Aggregate daily revenues into annual cash flows
-    annual_revenue = daily_revenue.reshape(projection_years, 365, -1).sum(axis=1)
+    # Aggregate period revenues into annual cash flows
+    annual_revenue = period_revenue.reshape(projection_years, 365 * 48, -1).sum(axis=1)
     
     # --- Additions for detailed projection ---
-    annual_btc_mined = btc_mined.reshape(projection_years, 365, -1).sum(axis=1)
-    annual_avg_price = daily_price.reshape(projection_years, 365).mean(axis=1)
-    annual_avg_difficulty = daily_difficulty.reshape(projection_years, 365).mean(axis=1)
+    annual_btc_mined = btc_mined.reshape(projection_years, 365 * 48, -1).sum(axis=1)
+    annual_avg_price = period_price.reshape(projection_years, 365 * 48).mean(axis=1)
+    annual_avg_difficulty = period_difficulty.reshape(projection_years, 365 * 48).mean(axis=1)
+    annual_energy_used_mwh = energy_used_mwh_period.reshape(projection_years, 365 * 48, -1).sum(axis=1)
+    annual_available_energy_mwh = available_energy_mwh_period.reshape(projection_years, 365 * 48, 1).sum(axis=1).squeeze()
     
     annual_details = {
         'revenue': annual_revenue,
         'btc_mined': annual_btc_mined,
         'avg_price': annual_avg_price,
-        'avg_difficulty': annual_avg_difficulty
+        'avg_difficulty': annual_avg_difficulty,
+        'energy_used_mwh': annual_energy_used_mwh,
+        'available_energy_mwh': annual_available_energy_mwh,
     }
     
     # Calculate final cash flows including investment and opex
@@ -366,11 +407,23 @@ def _run_single_simulation(sim_seed, fleet_sizes_arr, asic_specs, scenario_param
     npv = np.sum(cash_flows / discounts[:, np.newaxis], axis=0)
 
     # Calculate utilization and hashrate metrics
-    days_operational = (fleet_power_avail > 0).sum(axis=0)
-    avg_utilization = (days_operational / n_days) * 100 if n_days > 0 else 0
+    periods_operational = (fleet_power_avail > 0).sum(axis=0)
+    avg_utilization = (periods_operational / n_periods) * 100 if n_periods > 0 else 0
     total_effective_hashrate = effective_hashrate.sum(axis=0)
 
-    return npv, cash_flows, avg_utilization, total_effective_hashrate, annual_details
+    # Calculate full power percentage for standard installed power
+    full_power_intervals_std = (simulated_power_col >= fleet_power_req_row).sum(axis=0)
+    total_intervals = simulated_power_col.shape[0]
+    full_power_percent_std = (full_power_intervals_std / total_intervals) * 100
+
+    # Calculate for OC installed power if applicable
+    full_power_percent_oc = None
+    if asic_specs.get('enable_overclocking', False) and 'power_consumption_kw_oc' in asic_specs:
+        fleet_power_req_row_oc = fleet_sizes_arr * asic_specs['power_consumption_kw_oc']
+        full_power_intervals_oc = (simulated_power_col >= fleet_power_req_row_oc).sum(axis=0)
+        full_power_percent_oc = (full_power_intervals_oc / total_intervals) * 100
+
+    return npv, cash_flows, avg_utilization, total_effective_hashrate, annual_details, full_power_percent_std, full_power_percent_oc
 
 def calculate_irr(cash_flows):
     """Calculate Internal Rate of Return using numpy's IRR function"""
@@ -393,41 +446,16 @@ def calculate_irr(cash_flows):
             return np.nan  # No valid IRR exists
 
 def run_monte_carlo_simulation(hydro_stats, btc_data, asic_specs, annual_opex, 
-                             n_simulations, fleet_step, scenario_params, projection_years, pool_fee, discount_rate, additional_upfront_costs):
+                             n_simulations, fleet_sizes, scenario_params, projection_years, pool_fee, discount_rate, additional_upfront_costs):
     """Run Monte Carlo simulation for different fleet sizes."""
     import streamlit as st
 
     asic_hashrate = asic_specs['hash_rate_th']
     asic_power_kw = asic_specs['power_consumption_kw']
-    asic_price = asic_specs['unit_price']
-    
-    # Determine maximum fleet size based on overclocking capability
-    if asic_specs.get('enable_overclocking', False):
-        # When overclocking is enabled, limit fleet size to what can run in overclock mode
-        # This gives more realistic and optimal results
-        asic_power_kw_oc = asic_specs['power_consumption_kw_oc']
-        max_fleet_oc = int(hydro_stats['max_power_kw'] / asic_power_kw_oc) if asic_power_kw_oc > 0 else 0
-        max_fleet_standard = int(hydro_stats['max_power_kw'] / asic_power_kw) if asic_power_kw > 0 else 0
-        
-        # Use the overclock limit as the practical maximum for optimization
-        # This prevents testing unrealistic fleet sizes that would never achieve good utilization
-        max_fleet = max_fleet_oc
-        
-        st.info(f"""
-        🚀 **Overclocking Mode**: Testing fleet sizes optimized for overclock capability
-        - Max fleet in standard mode: {max_fleet_standard} ASICs
-        - Max fleet in overclock mode: {max_fleet_oc} ASICs
-        - **Testing range**: 1 to {max_fleet} ASICs (overclock-optimized)
-        """)
-    else:
-        max_fleet = int(hydro_stats['max_power_kw'] / asic_power_kw) if asic_power_kw > 0 else 0
-    
-    fleet_sizes = list(range(fleet_step, max_fleet + 1, fleet_step))
 
-    if not fleet_sizes:
-        st.warning("No fleet sizes to simulate. This might be due to low available power or high ASIC power consumption.")
+    if fleet_sizes is None or len(fleet_sizes) == 0:
+        st.warning("No fleet sizes to simulate. Please provide a non-empty list of fleet sizes.")
         return {}
-        
     fleet_sizes_arr = np.array(fleet_sizes)
 
     if n_simulations > 2000:
@@ -462,33 +490,77 @@ def run_monte_carlo_simulation(hydro_stats, btc_data, asic_specs, annual_opex,
     all_utilizations = np.array([res[2] for res in results_list])
     all_total_effective_hashrates = np.array([res[3] for res in results_list])
     all_annual_details = [res[4] for res in results_list]
+    all_full_power_percents_std = np.array([res[5] for res in results_list])
+    # OC may be None; build an array with NaNs where missing
+    oc_list = [res[6] for res in results_list]
+    if any(v is None for v in oc_list):
+        # Create a NaN array with same shape as std and fill rows when available
+        all_full_power_percents_oc = np.full_like(all_full_power_percents_std, np.nan)
+        for i, v in enumerate(oc_list):
+            if v is not None:
+                all_full_power_percents_oc[i] = v
+    else:
+        all_full_power_percents_oc = np.array(oc_list)
 
-    # --- New logic: Find cash flows from the median (P50) simulation ---
+    # --- New logic: Aggregate details across all simulations ---
+    # Create arrays to hold all simulation details for easier aggregation
+    # Shape: (n_simulations, n_years, n_fleets)
+    all_revenues = np.array([d['revenue'] for d in all_annual_details])
+    all_btc_mined = np.array([d['btc_mined'] for d in all_annual_details])
+    all_energy_used_mwh = np.array([d['energy_used_mwh'] for d in all_annual_details])
+    # Shape: (n_simulations, n_years)
+    all_avg_prices = np.array([d['avg_price'] for d in all_annual_details])
+    all_avg_difficulties = np.array([d['avg_difficulty'] for d in all_annual_details])
+    all_available_energy_mwh = np.array([d['available_energy_mwh'] for d in all_annual_details])
+
+    # Calculate median values across all simulations
+    median_annual_revenue = np.percentile(all_revenues, 50, axis=0)
+    median_annual_btc_mined = np.percentile(all_btc_mined, 50, axis=0)
+    median_annual_energy_used_mwh = np.percentile(all_energy_used_mwh, 50, axis=0)
+    median_avg_price = np.percentile(all_avg_prices, 50, axis=0)
+    median_avg_difficulty = np.percentile(all_avg_difficulties, 50, axis=0)
+    median_available_energy_mwh = np.percentile(all_available_energy_mwh, 50, axis=0)
+
+    # Find cash flows from the median (P50) simulation for IRR/Payback
     median_npvs = np.percentile(all_npvs, 50, axis=0)
     median_simulation_cash_flows = []
-    median_simulation_details = []
     for i in range(len(fleet_sizes)):
         npvs_for_fleet = all_npvs[:, i]
-        # Find the index of the simulation with the NPV closest to the median
         median_sim_idx = np.argmin(np.abs(npvs_for_fleet - median_npvs[i]))
-        # Get the cash flow from that specific simulation
         median_cash_flow = all_cash_flows[median_sim_idx, :, i]
         median_simulation_cash_flows.append(median_cash_flow.tolist())
-        
-        # Get details from that simulation
+
+    # --- Create the median simulation details for projection tables ---
+    median_simulation_details = []
+    for i in range(len(fleet_sizes)):
         details_for_fleet = {
-            'revenue': all_annual_details[median_sim_idx]['revenue'][:, i],
-            'btc_mined': all_annual_details[median_sim_idx]['btc_mined'][:, i],
-            'avg_price': all_annual_details[median_sim_idx]['avg_price'],
-            'avg_difficulty': all_annual_details[median_sim_idx]['avg_difficulty'],
+            'revenue': median_annual_revenue[:, i],
+            'btc_mined': median_annual_btc_mined[:, i],
+            'avg_price': median_avg_price,
+            'avg_difficulty': median_avg_difficulty,
+            'energy_used_mwh': median_annual_energy_used_mwh[:, i],
+            'available_energy_mwh': median_available_energy_mwh,
         }
         median_simulation_details.append(details_for_fleet)
     # --- End of new logic ---
 
     # Aggregate results
-    mean_total_effective_hashrate = np.mean(all_total_effective_hashrates, axis=0)
-    theoretical_max_total_hashrate = fleet_sizes_arr * asic_hashrate * 365 * projection_years
-    capacity_factor = np.divide(mean_total_effective_hashrate, theoretical_max_total_hashrate, out=np.zeros_like(mean_total_effective_hashrate), where=theoretical_max_total_hashrate > 0) * 100
+    # Capacity factor: average fraction of full hashrate delivered per period across the simulation
+    # all_total_effective_hashrates is the sum over periods of effective hashrate (TH/s) for each simulation & fleet
+    # Normalize by (max fleet hashrate TH/s) * (number of 30-min periods) to obtain a 0–100% percentage
+    n_periods = projection_years * 365 * 48
+    fleet_max_hashrate = fleet_sizes_arr * asic_hashrate  # TH/s per fleet at 100%
+    denom = fleet_max_hashrate * n_periods  # broadcast over simulations
+    capacity_factor = np.nanmean(
+        np.divide(
+            all_total_effective_hashrates,
+            denom,
+            out=np.zeros_like(all_total_effective_hashrates),
+            where=denom > 0
+        ),
+        axis=0
+    ) * 100
+    capacity_factor = np.clip(capacity_factor, 0, 100)
     
     results = {
         'fleet_sizes': fleet_sizes,
@@ -503,8 +575,13 @@ def run_monte_carlo_simulation(hydro_stats, btc_data, asic_specs, annual_opex,
         'irr_median': [],
         'payback_months': [],
         'capacity_factor': capacity_factor,
-        'median_simulation_cash_flows': median_simulation_cash_flows,
-        'median_simulation_details': median_simulation_details
+    'median_simulation_cash_flows': median_simulation_cash_flows,
+    'median_simulation_details': median_simulation_details,
+    # Simulated future power: percentage of periods with available power >= installed power
+    'full_power_percent_std_mean': np.nanmean(all_full_power_percents_std, axis=0),
+    'full_power_percent_std_p50': np.nanpercentile(all_full_power_percents_std, 50, axis=0),
+    'full_power_percent_oc_mean': np.nanmean(all_full_power_percents_oc, axis=0) if not np.isnan(all_full_power_percents_oc).all() else None,
+    'full_power_percent_oc_p50': np.nanpercentile(all_full_power_percents_oc, 50, axis=0) if not np.isnan(all_full_power_percents_oc).all() else None,
     }
 
     # IRR and Payback from MEDIAN simulation
@@ -643,6 +720,17 @@ def project_mining_economics(median_details_data, n_asics, asic_price, annual_op
         'Avg BTC Price': median_details_data['avg_price'],
         'Avg Difficulty': median_details_data['avg_difficulty'],
     })
+
+    # Optional energy columns if provided
+    if 'energy_used_mwh' in median_details_data:
+        df_years['Energy Used (MWh)'] = median_details_data['energy_used_mwh']
+    if 'available_energy_mwh' in median_details_data:
+        df_years['Available Curtailed Energy (MWh)'] = median_details_data['available_energy_mwh']
+    if 'Energy Used (MWh)' in df_years.columns and 'Available Curtailed Energy (MWh)' in df_years.columns:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            util = np.divide(df_years['Energy Used (MWh)'], df_years['Available Curtailed Energy (MWh)']) * 100.0
+            util = util.replace([np.inf, -np.inf], np.nan).fillna(0)
+        df_years['Curtailed Energy Utilization (%)'] = util
     df_years['Net Income'] = df_years['Revenue'] - df_years['Operating Costs']
     
     # Create the initial investment row (Year 0)
@@ -678,5 +766,14 @@ def project_mining_economics(median_details_data, n_asics, asic_price, annual_op
         'Year', 'BTC Mined', 'Revenue', 'Operating Costs', 'Net Income', 
         'Cumulative Cash Flow', 'Avg BTC Price', 'Avg Difficulty'
     ]
+    # Insert energy columns if present
+    energy_cols = [col for col in [
+        'Energy Used (MWh)', 'Available Curtailed Energy (MWh)', 'Curtailed Energy Utilization (%)'
+    ] if col in df.columns]
+    # Place energy columns after Operating Costs for readability
+    if energy_cols:
+        display_cols = ['Year', 'BTC Mined', 'Revenue', 'Operating Costs'] + energy_cols + [
+            'Net Income', 'Cumulative Cash Flow', 'Avg BTC Price', 'Avg Difficulty'
+        ]
     
     return df[display_cols], summary

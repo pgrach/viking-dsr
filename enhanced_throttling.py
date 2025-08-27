@@ -117,10 +117,11 @@ def calculate_standard_throttling(available_power_kw, n_asics, asic_specs):
 
 def vectorized_enhanced_throttling(simulated_power_col, fleet_sizes_arr, asic_specs):
     """
-    Vectorized version of enhanced throttling for Monte Carlo simulation
+    Vectorized version of enhanced throttling for Monte Carlo simulation.
+    This version is fully vectorized using numpy to avoid slow Python loops.
     
     Args:
-        simulated_power_col: Array of simulated power (n_days, 1)
+        simulated_power_col: Array of simulated power (n_periods, 1)
         fleet_sizes_arr: Array of fleet sizes to test (1, n_fleets)
         asic_specs: ASIC specifications dictionary
         
@@ -129,7 +130,7 @@ def vectorized_enhanced_throttling(simulated_power_col, fleet_sizes_arr, asic_sp
     """
     
     if not asic_specs.get('enable_overclocking', False):
-        # Use existing standard logic
+        # Use existing standard logic (this part is already vectorized)
         fleet_power_req_row = fleet_sizes_arr * asic_specs['power_consumption_kw']
         fleet_hashrate_row = fleet_sizes_arr * asic_specs['hash_rate_th']
         
@@ -147,31 +148,72 @@ def vectorized_enhanced_throttling(simulated_power_col, fleet_sizes_arr, asic_sp
         }
     
     else:
-        # Enhanced overclocking logic
+        # Enhanced overclocking logic (fully vectorized)
         base_power_kw = asic_specs['power_consumption_kw']
         base_hashrate = asic_specs['hash_rate_th']
         oc_power_kw = asic_specs['power_consumption_kw_oc']
         oc_hashrate = asic_specs['hash_rate_th_oc']
         
-        # Calculate power requirements for each fleet size
+        # Calculate power requirements for each fleet size (broadcastable)
         base_power_req_row = fleet_sizes_arr * base_power_kw
         oc_power_req_row = fleet_sizes_arr * oc_power_kw
+        fleet_hashrate_row = fleet_sizes_arr * base_hashrate
+        fleet_oc_hashrate_row = fleet_sizes_arr * oc_hashrate
+
+        # --- Define conditions for np.select ---
+        cond_offline = simulated_power_col <= 0
+        cond_full_oc = simulated_power_col >= oc_power_req_row
+        cond_mixed = (simulated_power_col >= base_power_req_row) & (simulated_power_col < oc_power_req_row)
+        # The last condition (throttled_standard) will be the default
         
-        # Initialize output arrays
-        n_days, n_fleets = simulated_power_col.shape[0], len(fleet_sizes_arr)
-        effective_hashrate = np.zeros((n_days, n_fleets))
-        power_used = np.zeros((n_days, n_fleets))
+        conditions = [cond_offline, cond_full_oc, cond_mixed]
+
+        # --- Define choices for effective_hashrate ---
         
-        for day in range(n_days):
-            available_power = simulated_power_col[day, 0]
-            
-            for fleet_idx, n_asics in enumerate(fleet_sizes_arr):
-                result = calculate_enhanced_throttling(available_power, n_asics, asic_specs)
-                effective_hashrate[day, fleet_idx] = result['effective_hashrate']
-                power_used[day, fleet_idx] = result['power_used']
+        # Choice for mixed mode
+        excess_power = simulated_power_col - base_power_req_row
+        additional_power_per_asic = oc_power_kw - base_power_kw
+        # Use np.floor and clip to ensure we don't get negative or too many OCs
+        n_asics_oc = np.floor(excess_power / additional_power_per_asic)
+        n_asics_oc = np.maximum(0, n_asics_oc)
+        n_asics_oc = np.minimum(n_asics_oc, fleet_sizes_arr)
+        n_asics_std = fleet_sizes_arr - n_asics_oc
+        mixed_hashrate = n_asics_oc * oc_hashrate + n_asics_std * base_hashrate
+        
+        # Choice for throttled mode
+        # The out array must match the broadcast shape of the operation
+        broadcast_shape = (simulated_power_col.shape[0], fleet_sizes_arr.shape[0])
+        out_array = np.zeros(broadcast_shape)
+        throttle_factor = np.divide(simulated_power_col, base_power_req_row, out=out_array, where=base_power_req_row > 0)
+        throttled_hashrate = fleet_hashrate_row * throttle_factor
+
+        hashrate_choices = [
+            0,                      # Offline
+            fleet_oc_hashrate_row,  # Full OC
+            mixed_hashrate          # Mixed
+        ]
+        effective_hashrate = np.select(conditions, hashrate_choices, default=throttled_hashrate)
+
+        # --- Define choices for power_used ---
+        
+        # Power for mixed mode
+        mixed_power = n_asics_oc * oc_power_kw + n_asics_std * base_power_kw
+        
+        # Power for throttled mode is all available power
+        throttled_power = simulated_power_col
+
+        power_choices = [
+            0,                  # Offline
+            oc_power_req_row,   # Full OC
+            mixed_power         # Mixed
+        ]
+        power_used = np.select(conditions, power_choices, default=throttled_power)
+        
+        # Final check to ensure power used doesn't exceed available power
+        power_used = np.minimum(power_used, simulated_power_col)
         
         return {
             'effective_hashrate': effective_hashrate,
             'power_used': power_used,
-            'throttle_factor': power_used / base_power_req_row
+            'throttle_factor': np.divide(power_used, base_power_req_row, out=np.zeros_like(power_used), where=base_power_req_row > 0)
         }

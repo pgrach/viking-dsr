@@ -54,6 +54,41 @@ streamlit run app.py
    - Risk metrics and utilization analysis
    - Detailed financial projections
 
+## Deploying to Streamlit Community Cloud (GitHub)
+
+Follow these steps to put this app online as "Viking DSR":
+
+1) Create the GitHub repo
+- Initialize Git in this folder and push to a new GitHub repo named viking-dsr under your account.
+
+2) Connect on Streamlit Cloud
+- Go to share.streamlit.io, click "New app" and select your viking-dsr repo.
+- Set the main file path to app.py.
+- Python version: 3.11 (or match your local).
+- Add secrets if needed in Streamlit Cloud (Settings → Secrets).
+
+3) Environment
+- The app uses requirements.txt for dependencies. Streamlit will auto-install on deploy.
+
+4) Data files
+- Commit btc_price.csv, btc_difficulty.csv, and at least one viking_halfhourly_curtailment_*.csv to the repo. The app auto-detects the latest CSV by filename.
+
+Optional: Local .streamlit config
+- Create .streamlit/config.toml to tweak theme and server options locally.
+
+Example config.toml
+
+```
+[server]
+headless = true
+port = 8501
+enableXsrfProtection = true
+
+[theme]
+base = "light"
+primaryColor = "#2c7be5"
+```
+
 ## File Structure
 
 ```
