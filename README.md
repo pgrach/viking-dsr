@@ -35,12 +35,47 @@ pip install -r requirements.txt
 
 ## Usage
 
-1. Run the Streamlit app:
+### Running the Application
+
+**Option 1: Automatic Port Handling (Recommended)**
+```bash
+python run_app.py
+```
+This script automatically finds an available port if 8501 is busy and handles port conflicts gracefully.
+
+**Option 2: Standard Streamlit Command**
 ```bash
 streamlit run app.py
 ```
 
-2. Configure parameters in the sidebar:
+**Option 3: Custom Port**
+```bash
+# Using the port resolution script with custom port
+python run_app.py 8502
+
+# Using streamlit directly with custom port
+streamlit run app.py --server.port 8502
+```
+
+### Troubleshooting Port Conflicts
+
+If you encounter "Port 8501 is already in use" error:
+
+1. **Use the automatic launcher**: `python run_app.py` - it will find an available port automatically
+2. **Kill existing processes**: Find and stop other Streamlit instances:
+   ```bash
+   # On Windows
+   netstat -ano | findstr :8501
+   taskkill /PID <process_id> /F
+   
+   # On Linux/Mac
+   lsof -ti:8501 | xargs kill -9
+   ```
+3. **Use a different port**: `streamlit run app.py --server.port 8502`
+
+### Application Configuration
+
+1. Configure parameters in the sidebar:
    - ASIC specifications (model, hashrate, power, price)
    - Operating costs
    - Simulation parameters
@@ -92,14 +127,20 @@ primaryColor = "#2c7be5"
 ## File Structure
 
 ```
-hydro-bitcoin-miner/
+viking-dsr/
 ├── app.py                 # Streamlit web application
+├── run_app.py            # Port-aware application launcher (recommended)
+├── start_app.sh          # Shell script launcher for Linux/Mac
+├── start_app.bat         # Batch script launcher for Windows
 ├── hydro_miner_model.py   # Core simulation and optimization logic
+├── enhanced_throttling.py # ASIC throttling and overclocking support
 ├── config.yaml           # Default configuration parameters
 ├── requirements.txt      # Python dependencies
-├── hydro_flow.xlsx      # Hydroelectric power data (user provided)
-├── btc_price.csv        # Bitcoin price data (user provided)
-└── btc_difficulty.csv   # Bitcoin difficulty data (user provided)
+├── .streamlit/
+│   └── config.toml       # Streamlit configuration (theme, CORS, etc.)
+├── btc_price.csv        # Bitcoin price data
+├── btc_difficulty.csv   # Bitcoin difficulty data
+└── viking_halfhourly_curtailment_*.csv # Hydroelectric power data
 ```
 
 ## Configuration
