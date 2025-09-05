@@ -1,0 +1,23 @@
+[server]
+# Default port (can be overridden by command line --server.port)
+port = 8501
+# Prevent the browser from opening automatically (useful for port conflicts)
+headless = true
+# Enable CORS (required when XSRF protection is enabled)
+enableCORS = true
+# Enable XSRF protection
+enableXsrfProtection = true
+# Set maximum upload size (200MB)
+maxUploadSize = 200
+
+[theme]
+# Light theme for better readability
+base = "light"
+primaryColor = "#2c7be5"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f2f6"
+textColor = "#262730"
+
+[browser]
+# Prevent automatic browser opening when there are port conflicts
+gatherUsageStats = false
